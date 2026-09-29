@@ -63,7 +63,7 @@ ParentSquare has an internal JSON:API (not publicly documented). Discovered by i
 - This lets Claude "see" attached calendars, flyers, staff photos etc. without extra tool calls
 
 ### Admin write tools (roster: students & guardians)
-Reverse-engineered from the admin roster UI and verified live (endpoints/bodies documented in Jason's vault note "ParentSquare admin API mapping"). v1 scope is **create/edit only** — no destructive ops (delete/unlink are deferred to the website).
+Reverse-engineered from the admin roster UI and verified live. v1 scope is **create/edit only** — no destructive ops (delete/unlink are deferred to the website).
 
 - **Write gate:** every write tool checks `writes_enabled()` (env `PS_ENABLE_WRITES`, default off) and returns a friendly message if disabled. Reads (`list_students`, `list_parents`, `list_grades`, `get_student`) are ungated.
 - **Audit:** `audit_write(tool, args, ok, detail)` appends JSONL to `PS_AUDIT_LOG` (default `~/.parentsquare_audit.log`) for every attempt, including blocked ones.
@@ -72,14 +72,14 @@ Reverse-engineered from the admin roster UI and verified live (endpoints/bodies 
 - **Rails method-override:** edit uses a POST with `_method=patch`.
 - **Match the real form's submission param-for-param, and omit any nested/collection key you did not intend to change.** Rails distinguishes a *missing* key from a *present-but-empty* one and treats present-but-empty as "clear it", so a stray empty key silently wipes data while a missing one can blow up the action. Both have caused live incidents here (see `build_add_student_body` / `build_edit_student_body`). This governs every new write tool, so establish the rule from the real form before inventing a body.
 - **Endpoints:** add_student `POST /schools/{id}/students`; edit_student `POST /schools/{id}/students/{sid}` (`_method=patch`); add_parent `POST /schools/{id}/users`; edit_parent + link_guardian `POST /schools/{id}/users/{uid}/update_institute_user` (`_method=patch`).
-- **Parent invitations** (verified live; see vault note "ParentSquare invitations API mapping"): `invite_parent` = `POST /schools/{id}/users/{user_id}/invite` (CSRF-only form body, via `post_form(path, {})`) — emails one guardian, resend uses the same endpoint. `bulk_invite_parents` = `POST /schools/{id}/users/invite` with a **JSON** body `{"ids": "<comma-joined user_ids>", "role": "PARENT", "selected": N}` (via `post_form`-style CSRF but JSON) — sends email/text, auto-skips already-registered ids, and the response is UJS `text/javascript` (not JSON), so it uses **`PSClient.post_json_raw()`** (POST JSON, return raw `Response`). "Invite all" = `bulk_invite_parents` over every `list_parents` guardian with `registered=false` (no dedicated endpoint). Target = guardian `user_id` from `list_parents`.
+- **Parent invitations** (verified live): `invite_parent` = `POST /schools/{id}/users/{user_id}/invite` (CSRF-only form body, via `post_form(path, {})`) — emails one guardian, resend uses the same endpoint. `bulk_invite_parents` = `POST /schools/{id}/users/invite` with a **JSON** body `{"ids": "<comma-joined user_ids>", "role": "PARENT", "selected": N}` (via `post_form`-style CSRF but JSON) — sends email/text, auto-skips already-registered ids, and the response is UJS `text/javascript` (not JSON), so it uses **`PSClient.post_json_raw()`** (POST JSON, return raw `Response`). "Invite all" = `bulk_invite_parents` over every `list_parents` guardian with `registered=false` (no dedicated endpoint). Target = guardian `user_id` from `list_parents`.
 - **Roster feeds** (positional-array JSON, whole roster in one call, client-side paging): `GET /schools/{id}/roster/students_data` (14 cols, surfaced by `list_students`) and `.../parents_data` (12 cols, surfaced by `list_parents` — the only tool that exposes a guardian `user_id`) — parsed in `parsers/admin.py`.
 - **Edit forms** (`.../{sid}/edit`, `.../{uid}/edit_institute_user?role=PARENT`) return JS-escaped HTML; `parsers/admin.py` extracts current field values (and the parent's shared `contact_id`) so edits preserve unchanged fields. `PSClient.get_text()` fetches these.
 - **Guardian links (nested attrs):** omitting `kids_attributes` on a parent PATCH leaves existing links untouched (verified) — so `edit_parent` sends none and `link_guardian_to_student` sends only the new kid under a unique numeric key. `edit_parent` email/phone are **one** contact record addressed at indices `[0]`(email)/`[2]`(phone) with the same `contact_id`.
 - **grade_id** is per-school (from `list_grades` / the roster add-modal `<select name="student[grade_id]">`). add_parent/link resolve the kid's grade_id from its edit form.
 
 ### Admin write tools (classes, staff & room parents)
-v3 scope, reverse-engineered from the rollover admin UI's JS bundle and verified live (see Jason's vault note "ParentSquare classes & staff API mapping"). Parsing, body builders and response interpretation live in `parsers/classes.py`. Same write gate + audit log as above. Non-destructive: no class or staff deletion. (For the record, class deletion *is* `DELETE /api/v2/schools/{id}/sections` with the ids **nested under `data`** — `{"data":{"ids":"50235549"}}` — and `Accept: application/vnd.api+json`. A flat `{"ids":…}` body or an `?ids=` query string returns 500. Not exposed as a tool: deletes are deferred to the website per the v1 destructive-op policy.)
+v3 scope, reverse-engineered from the rollover admin UI's JS bundle and verified live. Parsing, body builders and response interpretation live in `parsers/classes.py`. Same write gate + audit log as above. Non-destructive: no class or staff deletion. (For the record, class deletion *is* `DELETE /api/v2/schools/{id}/sections` with the ids **nested under `data`** — `{"data":{"ids":"50235549"}}` — and `Accept: application/vnd.api+json`. A flat `{"ids":…}` body or an `?ids=` query string returns 500. Not exposed as a tool: deletes are deferred to the website per the v1 destructive-op policy.)
 
 - **These are JSON:API endpoints returning real JSON**, so the UJS helpers (`write_succeeded`, `parse_flash_message`) do **not** apply. Use `PSClient.send_json(method, path, payload)` (CSRF + XHR headers, does not raise on 4xx/5xx) and interpret with `json_write_ok()` / `json_write_error()`, which mirror the UI's `checkAjaxError`. Exception: `add_staff` and `edit_staff` are classic Rails form posts and use `post_form` + `_write_result`.
 - **Endpoints:**
@@ -124,11 +124,15 @@ live in `models.py`; directory/selection parsing and form construction live in
 `parsers/groups.py`. Read those docstrings and `tests/test_groups.py` before
 changing a request or extractor.
 
+In `server.py`, `_read_group_state` loads the directory and saved selections,
+`_post_group_change` handles transport errors, and `_verify_group_change` compares
+states without mutating them. `_change_group_members` coordinates these steps
+under one lock and audits the result.
+
 - Reads follow all directory pages and validate the declared total, including owners, managers, and guests.
 - Writes currently support manually selected `CsvGroup` groups. They never create accounts or change ownership. Removals require explicit IDs and refuse owners/managers and student-derived groups.
 - Group writes use the existing write gate and audit log, and share `AppContext.section_membership_write_lock` with class/enrollment writes. Keep calls serial across processes too.
 - These are HTML form navigations, not the roster's UJS responses. `post_form(..., html_response=True)` selects that transport without changing existing callers. A fresh directory and selection read decides whether each write persisted; uncertain outcomes stop multi-person removal.
-- Browser-capture provenance and live-test limits are recorded in the private project note "ParentSquare group membership API mapping". Do not put real captured credentials or school rosters in repository fixtures.
 
 ## Development
 

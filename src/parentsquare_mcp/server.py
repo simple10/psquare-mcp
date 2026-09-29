@@ -70,7 +70,7 @@ from parentsquare_mcp.parsers.enrollment import (
 )
 
 from parentsquare_mcp.parsers.feeds import parse_feed_page, parse_post_detail
-from parentsquare_mcp.models import ClassStaff, Group, GroupMembersPage
+from parentsquare_mcp.models import ClassStaff, Group, GroupMembersPage, GroupMemberSelection
 from parentsquare_mcp.parsers.groups import (
     build_add_group_members_body,
     extract_group_member_selection,
@@ -1217,7 +1217,7 @@ async def list_forms(school_id: int, context: Context[Any, Any] = None) -> str:
 # Read tools (list_students, list_grades, get_student) are always available.
 # Write tools (add_/edit_student, add_/edit_parent, link_guardian_to_student)
 # are gated behind PS_ENABLE_WRITES and audited. v1 is create/edit only — no
-# destructive operations. See the vault note "ParentSquare admin API mapping".
+# destructive operations.
 # ---------------------------------------------------------------------------
 
 
@@ -1418,11 +1418,80 @@ def _group_members_snapshot(client: PSClient, group_id: int) -> GroupMembersPage
     return result
 
 
+def _read_group_state(
+    client: PSClient, group_id: int,
+) -> tuple[GroupMembersPage, GroupMemberSelection]:
+    members = _group_members_snapshot(client, group_id)
+    selection = extract_group_member_selection(
+        client.get_page(f"/groups/{group_id}/add_people"), group_id,
+    )
+    return members, selection
+
+
 async def _group_read(app, context, fn):
     try:
         return await _with_mfa_retry(app, context, fn)
     except (requests.RequestException, ValueError) as exc:
         return None, f"Could not read complete group membership: {exc}"
+
+
+async def _post_group_change(
+    app: AppContext, context: Context[Any, Any] | None, path: str, body: dict[str, Any],
+) -> tuple[requests.Response | None, str | None]:
+    """Keep transport failures available for reporting after membership readback."""
+    try:
+        return await _with_mfa_retry(
+            app, context, lambda: app.client.post_form(path, body, html_response=True),
+        )
+    except requests.RequestException as exc:
+        return None, str(exc)
+
+
+def _verify_group_change(
+    before: GroupMembersPage,
+    selection: GroupMemberSelection,
+    after: GroupMembersPage,
+    selected: GroupMemberSelection,
+    changed_user_ids: list[int],
+    *,
+    removing: bool,
+) -> str | None:
+    """Compare against the original state and all changes attempted so far."""
+    changing = set(changed_user_ids)
+    expected_roles = {m.user_id: m.role for m in before.members}
+    expected_selected = set(selection.member_ids)
+    actual_roles = {m.user_id: m.role for m in after.members}
+    if removing:
+        expected_roles = {u: role for u, role in expected_roles.items() if u not in changing}
+        expected_selected -= changing
+        expected_ids = set(expected_roles)
+    else:
+        expected_ids = set(expected_roles) | changing
+        # Existing guests return as guest associations, not saved user tokens.
+        expected_selected.update(u for u in changing if actual_roles.get(u) == "member")
+
+    differences = []
+    if set(actual_roles) != expected_ids:
+        differences.append(
+            f"Missing expected user_ids: {sorted(expected_ids - actual_roles.keys())}; "
+            f"unexpected user_ids: {sorted(actual_roles.keys() - expected_ids)}."
+        )
+    changed_roles = sorted(u for u, role in expected_roles.items() if actual_roles.get(u) != role)
+    if changed_roles:
+        differences.append(f"Existing roles were not preserved for user_ids: {changed_roles}.")
+    if not removing:
+        invalid_roles = sorted(u for u in changing if actual_roles.get(u) not in ("member", "guest"))
+        if invalid_roles:
+            differences.append(f"Added user_ids lack member/guest roles: {invalid_roles}.")
+    if (after.school_id, after.name, after.student_count) != (
+        before.school_id, before.name, before.student_count,
+    ):
+        differences.append("Group identity or student count changed.")
+    if set(selected.member_ids) != expected_selected:
+        differences.append("Saved user selections differ from the intended change.")
+    if selected.student_ids != selection.student_ids:
+        differences.append("Saved student selections changed.")
+    return " ".join(differences) or None
 
 
 @mcp.tool(name="list_group_members")
@@ -1456,7 +1525,10 @@ async def list_group_members(group_id: int, context: Context[Any, Any] = None) -
     }
 
 
-async def _change_group_members(app, context, group_id, user_ids, *, removing):
+async def _change_group_members(
+    app: AppContext, context: Context[Any, Any] | None,
+    group_id: int, user_ids: list[int], *, removing: bool,
+) -> str:
     tool = "remove_group_members" if removing else "add_group_members"
     args = {"group_id": group_id, "user_ids": user_ids}
 
@@ -1468,19 +1540,12 @@ async def _change_group_members(app, context, group_id, user_ids, *, removing):
         return finish(False, "❌ Pass a positive group_id and a nonempty list of positive user_ids.")
     wanted = list(dict.fromkeys(user_ids))
     async with _section_membership_write_lock(app):
-        before, err = await _group_read(
-            app, context, lambda: _group_members_snapshot(app.client, group_id),
+        state, err = await _group_read(
+            app, context, lambda: _read_group_state(app.client, group_id),
         )
         if err:
             return finish(False, f"❌ {err} No write attempted.")
-        selection, err = await _group_read(
-            app, context,
-            lambda: extract_group_member_selection(
-                app.client.get_page(f"/groups/{group_id}/add_people"), group_id,
-            ),
-        )
-        if err:
-            return finish(False, f"❌ {err} No write attempted.")
+        before, selection = state
         by_id = {m.user_id: m for m in before.members}
         if not set(selection.member_ids) <= by_id.keys():
             return finish(False, "❌ Saved selections disagree with the directory. No write attempted.")
@@ -1509,8 +1574,6 @@ async def _change_group_members(app, context, group_id, user_ids, *, removing):
             if not set(changing) <= available:
                 return finish(False, "❌ Some user_ids are not available in this group's existing-person picker.")
 
-        expected_roles = {m.user_id: m.role for m in before.members}
-        expected_selected = set(selection.member_ids)
         completed = []
         batches = [[u] for u in changing] if removing else [changing]
         for batch in batches:
@@ -1518,62 +1581,32 @@ async def _change_group_members(app, context, group_id, user_ids, *, removing):
                 user_id = batch[0]
                 path = f"/groups/{group_id}/remove_user?member={user_id}"
                 body = {"_method": "post"}
-                expected_roles.pop(user_id)
-                expected_selected.discard(user_id)
             else:
                 path = f"/groups/{group_id}"
                 body = build_add_group_members_body(selection, batch)
 
-            transport_error = None
-            response = None
-            try:
-                response, err = await _with_mfa_retry(
-                    app, context,
-                    lambda: app.client.post_form(path, body, html_response=True),
-                )
-                if err:
-                    transport_error = err
-            except requests.RequestException as exc:
-                transport_error = str(exc)
+            response, transport_error = await _post_group_change(app, context, path, body)
             request_detail = (
                 f"HTTP {response.status_code}" if response is not None
                 else transport_error or "no response"
             )
 
-            def readback():
-                current = _group_members_snapshot(app.client, group_id)
-                selected = extract_group_member_selection(
-                    app.client.get_page(f"/groups/{group_id}/add_people"), group_id,
-                )
-                return current, selected
-
-            state, err = await _readback(app, context, readback)
+            state, err = await _readback(
+                app, context, lambda: _read_group_state(app.client, group_id),
+            )
             if err:
                 return finish(False, (
                     f"⚠️ Membership write outcome is unknown ({request_detail}); read-back failed: {err}. "
                     f"Previously verified user_ids: {completed}. Do not retry blindly; use list_group_members."
                 ))
             after, selected = state
-            actual_roles = {m.user_id: m.role for m in after.members}
-            if not removing:
-                # Existing guests return as guest associations, not saved user tokens.
-                expected_selected.update(u for u in batch if actual_roles.get(u) == "member")
-            expected_ids = set(expected_roles) if removing else set(expected_roles) | set(batch)
-            preserved = all(actual_roles.get(u) == role for u, role in expected_roles.items())
-            ordinary_additions = removing or all(
-                actual_roles.get(u) in ("member", "guest") for u in batch
+            mismatch = _verify_group_change(
+                before, selection, after, selected, completed + batch, removing=removing,
             )
-            if (set(actual_roles) != expected_ids or not preserved
-                    or not ordinary_additions
-                    or after.school_id != before.school_id or after.name != before.name
-                    or after.student_count != before.student_count
-                    or set(selected.member_ids) != expected_selected
-                    or selected.student_ids != selection.student_ids):
+            if mismatch:
                 return finish(False, (
                     f"⚠️ Group membership did not match the intended change or unrelated state changed "
-                    f"({request_detail}). "
-                    f"Missing expected user_ids: {sorted(expected_ids - actual_roles.keys())}; "
-                    f"unexpected user_ids: {sorted(actual_roles.keys() - expected_ids)}. "
+                    f"({request_detail}). {mismatch} "
                     f"Previously verified user_ids: {completed}. Stop and inspect list_group_members; "
                     "do not retry blindly."
                 ))

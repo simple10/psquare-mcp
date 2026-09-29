@@ -219,6 +219,79 @@ def fixture(monkeypatch, tmp_path):
     return client, context
 
 
+@pytest.mark.parametrize("changes,member_ids,removing", [
+    ({5: "member"}, [2, 5], False),
+    ({7: "guest"}, [2], False),
+    ({5: "member", 7: "guest"}, [2, 5], False),
+    ({2: None, 3: None}, [], True),
+])
+def test_group_verification_is_pure_and_handles_cumulative_changes(
+    fixture, changes, member_ids, removing,
+):
+    client, _ = fixture
+    client.students = [10, 11] if not removing else []
+    before, selection_before = server._read_group_state(client, 9)
+    for user_id, role in changes.items():
+        if role is None:
+            client.roles.pop(user_id)
+        else:
+            client.roles[user_id] = role
+    client.selected = member_ids
+    after, selection_after = server._read_group_state(client, 9)
+    states = (before, selection_before, after, selection_after)
+    unchanged = deepcopy(states)
+
+    for _ in range(2):
+        assert server._verify_group_change(
+            *states, list(changes), removing=removing,
+        ) is None
+        assert states == unchanged
+
+
+@pytest.mark.parametrize("target,field,value,diagnostic", [
+    ("group", "school_id", 8, "Group identity or student count changed"),
+    ("group", "name", "Changed", "Group identity or student count changed"),
+    ("group", "student_count", 3, "Group identity or student count changed"),
+    ("selection", "member_ids", [2], "Saved user selections differ"),
+    ("selection", "student_ids", [11, 10], "Saved student selections changed"),
+    ("owner", "role", "member", "Existing roles were not preserved for user_ids: [1]"),
+    ("addition", "role", "owner", "Added user_ids lack member/guest roles: [5]"),
+])
+def test_group_verification_explains_unrelated_changes(fixture, target, field, value, diagnostic):
+    client, _ = fixture
+    client.students = [10, 11]
+    before, selection_before = server._read_group_state(client, 9)
+    client.roles[5] = "member"
+    client.selected.append(5)
+    after, selection_after = server._read_group_state(client, 9)
+    targets = {
+        "group": after, "selection": selection_after,
+        "owner": after.members[0], "addition": next(m for m in after.members if m.user_id == 5),
+    }
+    setattr(targets[target], field, value)
+
+    mismatch = server._verify_group_change(
+        before, selection_before, after, selection_after, [5], removing=False,
+    )
+    assert diagnostic in mismatch
+
+
+@pytest.mark.parametrize("after_write", [False, True])
+def test_missing_selection_blocks_write_or_reports_unknown_outcome(fixture, monkeypatch, after_write):
+    client, context = fixture
+    original = client.get_page
+
+    def get_page(path, params=None):
+        if path.endswith("/add_people") and (not after_write or client.writes):
+            return soup("<html>Unexpected form</html>")
+        return original(path, params)
+
+    monkeypatch.setattr(client, "get_page", get_page)
+    result = asyncio.run(server.add_group_members(9, [5], context=context))
+    assert len(client.writes) == (1 if after_write else 0)
+    assert ("outcome is unknown" if after_write else "No write attempted") in result
+
+
 def test_list_is_ungated_and_reads_all_pages(fixture, monkeypatch):
     client, context = fixture
     monkeypatch.setenv("PS_ENABLE_WRITES", "0")
@@ -424,11 +497,15 @@ def test_membership_tools_share_the_existing_global_lock(fixture, monkeypatch):
     client, context = fixture
     app = context.request_context.lifespan_context
     original_read = server._group_read
+    original_readback = server._readback
+    readback_entered = asyncio.Event()
+    release_readback = asyncio.Event()
     active = 0
     maximum = 0
 
     async def slow_read(*args):
         nonlocal active, maximum
+        assert app.section_membership_write_lock.locked()
         active += 1
         maximum = max(maximum, active)
         await asyncio.sleep(0.01)
@@ -436,7 +513,15 @@ def test_membership_tools_share_the_existing_global_lock(fixture, monkeypatch):
         active -= 1
         return result
 
+    async def paused_readback(*args):
+        assert app.section_membership_write_lock.locked()
+        if len(client.writes) == 1:
+            readback_entered.set()
+            await release_readback.wait()
+        return await original_readback(*args)
+
     monkeypatch.setattr(server, "_group_read", slow_read)
+    monkeypatch.setattr(server, "_readback", paused_readback)
 
     async def run():
         async with server._section_membership_write_lock(app):
@@ -444,6 +529,10 @@ def test_membership_tools_share_the_existing_global_lock(fixture, monkeypatch):
             second = asyncio.create_task(server.add_group_members(9, [6], context=context))
             await asyncio.sleep(0.02)
             assert client.writes == []
+        await asyncio.wait_for(readback_entered.wait(), timeout=1)
+        assert len(client.writes) == 1
+        assert not second.done()
+        release_readback.set()
         return await asyncio.gather(first, second)
 
     results = asyncio.run(run())
