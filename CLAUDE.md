@@ -116,6 +116,20 @@ v4 scope, reverse-engineered from `/schools/{id}/roster/assign_classes` and its 
 - **CSV import is not a viable alternative**: `sections/sample_roster_csv` matches rows on **Student External ID** with no name/email fallback, and 290 of 644 students have no SIS id.
 
 
+### Admin tools (group membership)
+
+`list_group_members`, `add_group_members`, and `remove_group_members` manage
+existing users' group relationships, independently of classroom roles. Models
+live in `models.py`; directory/selection parsing and form construction live in
+`parsers/groups.py`. Read those docstrings and `tests/test_groups.py` before
+changing a request or extractor.
+
+- Reads follow all directory pages and validate the declared total, including owners, managers, and guests.
+- Writes currently support manually selected `CsvGroup` groups. They never create accounts or change ownership. Removals require explicit IDs and refuse owners/managers and student-derived groups.
+- Group writes use the existing write gate and audit log, and share `AppContext.section_membership_write_lock` with class/enrollment writes. Keep calls serial across processes too.
+- These are HTML form navigations, not the roster's UJS responses. `post_form(..., html_response=True)` selects that transport without changing existing callers. A fresh directory and selection read decides whether each write persisted; uncertain outcomes stop multi-person removal.
+- Browser-capture provenance and live-test limits are recorded in the private project note "ParentSquare group membership API mapping". Do not put real captured credentials or school rosters in repository fixtures.
+
 ## Development
 
 ```bash
