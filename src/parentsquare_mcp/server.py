@@ -70,8 +70,14 @@ from parentsquare_mcp.parsers.enrollment import (
 )
 
 from parentsquare_mcp.parsers.feeds import parse_feed_page, parse_post_detail
-from parentsquare_mcp.models import ClassStaff, Group
-from parentsquare_mcp.parsers.groups import parse_group_feed
+from parentsquare_mcp.models import ClassStaff, Group, GroupMembersPage, GroupMemberSelection
+from parentsquare_mcp.parsers.groups import (
+    build_add_group_members_body,
+    extract_group_member_selection,
+    parse_group_feed,
+    parse_group_members_page,
+    parse_group_selectable_user_ids,
+)
 from parentsquare_mcp.parsers.links import parse_links_page
 from parentsquare_mcp.parsers.notices import parse_notices
 from parentsquare_mcp.parsers.payments import parse_payments_page
@@ -128,6 +134,9 @@ parallel, even for different sections. ParentSquare uses full-replace endpoints,
 and concurrent writes have silently lost staff associations and student classes.
 This server serializes these writes within one process, but callers must still
 issue them one at a time and verify with fresh reads.
+Group-membership writes share this lock. Never run add_group_members or
+remove_group_members in parallel; these tools protect owners and managers and
+verify membership after each write.
 """
 
 
@@ -1208,7 +1217,7 @@ async def list_forms(school_id: int, context: Context[Any, Any] = None) -> str:
 # Read tools (list_students, list_grades, get_student) are always available.
 # Write tools (add_/edit_student, add_/edit_parent, link_guardian_to_student)
 # are gated behind PS_ENABLE_WRITES and audited. v1 is create/edit only — no
-# destructive operations. See the vault note "ParentSquare admin API mapping".
+# destructive operations.
 # ---------------------------------------------------------------------------
 
 
@@ -1376,6 +1385,285 @@ def _write_gated(func):
         return await func(*args, **kwargs)
 
     return wrapper
+
+
+def _group_members_snapshot(client: PSClient, group_id: int) -> GroupMembersPage:
+    """Read every member page; refuse partial, looping, or inconsistent results."""
+    result = parse_group_members_page(client.get_page(f"/groups/{group_id}/users"), group_id)
+    members = {m.user_id: m for m in result.members}
+    page = 1
+    next_page = result.next_page
+    while next_page is not None:
+        if next_page <= page or next_page > 1000:
+            raise ValueError("Group pagination did not advance or exceeded 1000 pages.")
+        page = next_page
+        current = parse_group_members_page(
+            client.get_page(f"/groups/{group_id}/users", params={"member_page": page}), group_id,
+        )
+        if (current.name, current.school_id, current.total_count, current.student_count) != (
+            result.name, result.school_id, result.total_count, result.student_count,
+        ):
+            raise ValueError("Group directory changed during pagination; read it again.")
+        for member in current.members:
+            if member.user_id in members and members[member.user_id] != member:
+                raise ValueError("Conflicting group membership across pages.")
+            members[member.user_id] = member
+        next_page = current.next_page
+    if len(members) != result.total_count:
+        raise ValueError(
+            f"Incomplete group directory: read {len(members)} of {result.total_count} people."
+        )
+    result.members = list(members.values())
+    result.next_page = None
+    return result
+
+
+def _read_group_state(
+    client: PSClient, group_id: int,
+) -> tuple[GroupMembersPage, GroupMemberSelection]:
+    members = _group_members_snapshot(client, group_id)
+    selection = extract_group_member_selection(
+        client.get_page(f"/groups/{group_id}/add_people"), group_id,
+    )
+    return members, selection
+
+
+async def _group_read(app, context, fn):
+    try:
+        return await _with_mfa_retry(app, context, fn)
+    except (requests.RequestException, ValueError) as exc:
+        return None, f"Could not read complete group membership: {exc}"
+
+
+async def _post_group_change(
+    app: AppContext, context: Context[Any, Any] | None, path: str, body: dict[str, Any],
+) -> tuple[requests.Response | None, str | None]:
+    """Keep transport failures available for reporting after membership readback."""
+    try:
+        return await _with_mfa_retry(
+            app, context, lambda: app.client.post_form(path, body, html_response=True),
+        )
+    except requests.RequestException as exc:
+        return None, str(exc)
+
+
+def _verify_group_change(
+    before: GroupMembersPage,
+    selection: GroupMemberSelection,
+    after: GroupMembersPage,
+    selected: GroupMemberSelection,
+    changed_user_ids: list[int],
+    *,
+    removing: bool,
+) -> str | None:
+    """Compare against the original state and all changes attempted so far."""
+    changing = set(changed_user_ids)
+    expected_roles = {m.user_id: m.role for m in before.members}
+    expected_selected = set(selection.member_ids)
+    actual_roles = {m.user_id: m.role for m in after.members}
+    if removing:
+        expected_roles = {u: role for u, role in expected_roles.items() if u not in changing}
+        expected_selected -= changing
+        expected_ids = set(expected_roles)
+    else:
+        expected_ids = set(expected_roles) | changing
+        # Existing guests return as guest associations, not saved user tokens.
+        expected_selected.update(u for u in changing if actual_roles.get(u) == "member")
+
+    differences = []
+    if set(actual_roles) != expected_ids:
+        differences.append(
+            f"Missing expected user_ids: {sorted(expected_ids - actual_roles.keys())}; "
+            f"unexpected user_ids: {sorted(actual_roles.keys() - expected_ids)}."
+        )
+    changed_roles = sorted(u for u, role in expected_roles.items() if actual_roles.get(u) != role)
+    if changed_roles:
+        differences.append(f"Existing roles were not preserved for user_ids: {changed_roles}.")
+    if not removing:
+        invalid_roles = sorted(u for u in changing if actual_roles.get(u) not in ("member", "guest"))
+        if invalid_roles:
+            differences.append(f"Added user_ids lack member/guest roles: {invalid_roles}.")
+    if (after.school_id, after.name, after.student_count) != (
+        before.school_id, before.name, before.student_count,
+    ):
+        differences.append("Group identity or student count changed.")
+    if set(selected.member_ids) != expected_selected:
+        differences.append("Saved user selections differ from the intended change.")
+    if selected.student_ids != selection.student_ids:
+        differences.append("Saved student selections changed.")
+    return " ".join(differences) or None
+
+
+@mcp.tool(name="list_group_members")
+async def list_group_members(group_id: int, context: Context[Any, Any] = None) -> dict | str:
+    """List all group members, including owners, managers, and existing guests.
+
+    Follows all member pages and checks the total; never returns a partial list
+    as complete. Group membership is independent of classroom Room Parent roles.
+
+    Args:
+        group_id: Group ID from list_groups
+    """
+    if group_id <= 0:
+        return "❌ group_id must be a positive integer."
+    app = _app(context)
+    group, err = await _group_read(
+        app, context, lambda: _group_members_snapshot(app.client, group_id),
+    )
+    if err:
+        return f"❌ {err}"
+    return {
+        "group_id": group_id,
+        "school_id": group.school_id,
+        "name": group.name,
+        "count": group.total_count,
+        "student_count": group.student_count,
+        "members": [
+            {"user_id": m.user_id, "name": m.name, "role": m.role, "removable": m.removable}
+            for m in group.members
+        ],
+    }
+
+
+async def _change_group_members(
+    app: AppContext, context: Context[Any, Any] | None,
+    group_id: int, user_ids: list[int], *, removing: bool,
+) -> str:
+    tool = "remove_group_members" if removing else "add_group_members"
+    args = {"group_id": group_id, "user_ids": user_ids}
+
+    def finish(ok, message):
+        audit_write(tool, args, ok, detail=message)
+        return message
+
+    if group_id <= 0 or not user_ids or any(type(u) is not int or u <= 0 for u in user_ids):
+        return finish(False, "❌ Pass a positive group_id and a nonempty list of positive user_ids.")
+    wanted = list(dict.fromkeys(user_ids))
+    async with _section_membership_write_lock(app):
+        state, err = await _group_read(
+            app, context, lambda: _read_group_state(app.client, group_id),
+        )
+        if err:
+            return finish(False, f"❌ {err} No write attempted.")
+        before, selection = state
+        by_id = {m.user_id: m for m in before.members}
+        if not set(selection.member_ids) <= by_id.keys():
+            return finish(False, "❌ Saved selections disagree with the directory. No write attempted.")
+        if removing:
+            protected = [u for u in wanted if u in by_id and by_id[u].role in ("owner", "manager")]
+            if protected:
+                return finish(False, f"❌ Refusing to remove group owners/managers: {protected}.")
+            changing = [u for u in wanted if u in by_id]
+            if selection.student_ids and changing:
+                return finish(False, "❌ Student-derived groups are read-only for removals; use the website.")
+            if any(not by_id[u].removable for u in changing):
+                return finish(False, "❌ The group directory does not permit removing every selected person.")
+        else:
+            changing = [u for u in wanted if u not in by_id]
+        if not changing:
+            return finish(True, "ℹ️ No change needed; all requested people are already present or absent.")
+        if not removing:
+            available, err = await _group_read(
+                app, context,
+                lambda: parse_group_selectable_user_ids(app.client.get_json(
+                    f"/schools/{before.school_id}/selection_users", params={"group_id": group_id},
+                )),
+            )
+            if err:
+                return finish(False, f"❌ {err} No write attempted.")
+            if not set(changing) <= available:
+                return finish(False, "❌ Some user_ids are not available in this group's existing-person picker.")
+
+        completed = []
+        batches = [[u] for u in changing] if removing else [changing]
+        for batch in batches:
+            if removing:
+                user_id = batch[0]
+                path = f"/groups/{group_id}/remove_user?member={user_id}"
+                body = {"_method": "post"}
+            else:
+                path = f"/groups/{group_id}"
+                body = build_add_group_members_body(selection, batch)
+
+            response, transport_error = await _post_group_change(app, context, path, body)
+            request_detail = (
+                f"HTTP {response.status_code}" if response is not None
+                else transport_error or "no response"
+            )
+
+            state, err = await _readback(
+                app, context, lambda: _read_group_state(app.client, group_id),
+            )
+            if err:
+                return finish(False, (
+                    f"⚠️ Membership write outcome is unknown ({request_detail}); read-back failed: {err}. "
+                    f"Previously verified user_ids: {completed}. Do not retry blindly; use list_group_members."
+                ))
+            after, selected = state
+            mismatch = _verify_group_change(
+                before, selection, after, selected, completed + batch, removing=removing,
+            )
+            if mismatch:
+                return finish(False, (
+                    f"⚠️ Group membership did not match the intended change or unrelated state changed "
+                    f"({request_detail}). {mismatch} "
+                    f"Previously verified user_ids: {completed}. Stop and inspect list_group_members; "
+                    "do not retry blindly."
+                ))
+            if response is not None and 400 <= response.status_code < 500:
+                return finish(False, (
+                    f"⚠️ ParentSquare returned HTTP {response.status_code}, although read-back matches "
+                    "the intended membership. Do not retry; inspect list_group_members."
+                ))
+            completed.extend(batch)
+            if transport_error or (response is not None and response.status_code >= 500):
+                detail = transport_error or f"HTTP {response.status_code}"
+                return finish(len(completed) == len(changing), (
+                    f"⚠️ Membership change verified for user_ids {completed}, but the request reported "
+                    f"{detail}. Stopped before any further removals; do not retry verified changes."
+                ))
+        return finish(True, (
+            f"✅ {'Removed' if removing else 'Added'} {len(completed)} group member(s) "
+            f"(verified); owners, managers, and unrelated members preserved."
+        ))
+
+
+@mcp.tool(name="add_group_members")
+@_write_gated
+async def add_group_members(
+    group_id: int, user_ids: list[int], context: Context[Any, Any] = None,
+) -> str:
+    """Add existing people to a manually selected group. Requires PS_ENABLE_WRITES.
+
+    Preserves saved user/student selections, owners, managers, and guest members.
+    Skips existing members; does not create accounts or change ownership.
+    Calls are serialized with all membership writes, but separate server processes
+    are not coordinated: call serially and fresh-read afterward.
+
+    Args:
+        group_id: Group ID from list_groups
+        user_ids: Existing user IDs from list_parents, list_staff, or list_group_members
+    """
+    return await _change_group_members(_app(context), context, group_id, user_ids, removing=False)
+
+
+@mcp.tool(name="remove_group_members")
+@_write_gated
+async def remove_group_members(
+    group_id: int, user_ids: list[int], context: Context[Any, Any] = None,
+) -> str:
+    """Remove specific ordinary/guest group members without deleting their accounts.
+
+    Requires PS_ENABLE_WRITES. Refuses owners/managers, empty targets, and
+    student-derived groups. Skips absent people. Uses one targeted POST per person,
+    verifying each before proceeding; stops on failure/uncertainty. Never call
+    membership writes in parallel, including across groups or server processes.
+
+    Args:
+        group_id: Group ID from list_groups
+        user_ids: Explicit user IDs from list_group_members; never an empty list
+    """
+    return await _change_group_members(_app(context), context, group_id, user_ids, removing=True)
 
 
 @mcp.tool(name="list_students")
@@ -1916,7 +2204,7 @@ async def _put_class_staff(app, context, tool: str, args: dict, section_id: int,
 
 
 def _section_membership_write_lock(app) -> asyncio.Lock:
-    """Return the app-wide lock protecting section membership mutations."""
+    """Return the app-wide lock protecting section and group membership mutations."""
     lock = getattr(app, "section_membership_write_lock", None)
     if lock is None:
         lock = asyncio.Lock()

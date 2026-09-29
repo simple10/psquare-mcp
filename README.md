@@ -50,14 +50,15 @@ Available on the [MCP Registry](https://registry.modelcontextprotocol.io) as `io
 ### Groups & Discovery
 - **`list_schools`** — Schools and students as structured JSON
 - **`list_school_features`** — Available sections per school (parsed from sidebar)
-- **`list_groups`** — Groups with member counts, descriptions, and membership status
+- **`list_groups`** — Groups with active post counts and descriptions
+- **`list_group_members`** — Complete group directory as structured JSON, distinguishing ordinary members, guests, owners, and managers
 - **`list_links`** — Quick-access links (Google Drive, external sites)
 
 ### Student
 - **`get_student_dashboard`** — School, grade, classes, and teachers as structured JSON
 
 ### Admin
-Read tools are always available; the tools marked *(write)* below are **disabled by default** and only run when `PS_ENABLE_WRITES` is set (see [Enabling admin write tools](#enabling-admin-write-tools)). Every write *attempt*, including one blocked by the gate, is recorded to a local audit log. **No tool deletes a record** — students, guardians, classes, and staff can be created and edited but never deleted, and the tools that remove something only unlink a relationship (a staff assignment or a class enrollment), leaving the underlying people and classes intact. Deletion is deliberately left to the ParentSquare website.
+Read tools are always available; the tools marked *(write)* below are **disabled by default** and only run when `PS_ENABLE_WRITES` is set (see [Enabling admin write tools](#enabling-admin-write-tools)). Every write *attempt*, including one blocked by the gate, is recorded to a local audit log. **No tool deletes a record** — students, guardians, classes, and staff can be created and edited but never deleted, and the tools that remove something only unlink a relationship (a staff assignment, class enrollment, or group membership), leaving the underlying people, classes, and groups intact. Deletion is deliberately left to the ParentSquare website.
 
 #### Roster: students & guardians
 - **`list_students`** — School roster (id, name, grade, SIS id, guardians) as structured JSON, with optional `grade` / `name_contains` filters
@@ -84,6 +85,16 @@ Read tools are always available; the tools marked *(write)* below are **disabled
 - **`list_class_students`** — The students enrolled in a class
 - **`add_class_students`** / **`remove_class_students`** / **`move_student_to_class`** *(write)* — Manage which students are enrolled in which classes. These share the same global serialization lock as class-staff writes because student-section updates can replace a student's full enrollment list.
 
+#### Group membership
+- **`add_group_members`** *(write)* — Add existing people to a manually selected group (`group_id`, `user_ids`). Preserves saved user/student selections, owners, managers, and existing guests; skips people already present. Does not create accounts or invite new guests.
+- **`remove_group_members`** *(write)* — Remove explicit ordinary/guest members, one verified operation per person. Refuses empty targets, owners/managers, and groups with student-derived membership; skips absent people. Stops on an uncertain result and reports previously verified changes.
+
+Group writes currently support manually selected (`CsvGroup`) groups, not rule-based
+groups or ownership changes. They share the class/enrollment write lock, validate
+complete directory reads, and verify both membership and saved selections after
+each write. Use them serially, even across server processes. Classroom Room Parent
+roles and membership of a Room Parents group are independent.
+
 ### Authentication
 - **`submit_mfa_code`** — Complete MFA verification with a 6-digit code
 - Supports MCP elicitation for inline MFA prompts (set `PS_NO_ELICIT` to disable for unattended callers)
@@ -95,7 +106,7 @@ Read tools are always available; the tools marked *(write)* below are **disabled
 ### Enabling admin write tools
 
 The admin write tools — every tool marked *(write)* under [Admin](#admin), covering
-the student/guardian roster, classes, staff, and class enrollment — modify live
+the student/guardian roster, classes, staff, class enrollment, and groups — modify live
 school data, so they are **off by default**. To enable them, set `PS_ENABLE_WRITES=1`
 (or `true`/`yes`/`on`) in the server's environment and restart. Every write attempt
 (including blocked ones) is appended as JSONL to `PS_AUDIT_LOG` (default
@@ -226,7 +237,8 @@ On first use, the server auto-discovers your schools, students, and user ID from
 
 For `get_post`, image attachments are downloaded and returned as MCP `Image` objects (so Claude can see them), and PDF attachments have their text extracted via pymupdf. `get_staff_member` also returns inline profile photos.
 
-Groups use a GraphQL endpoint (`/graphql`) instead of HTML scraping. The directory and staff details use the internal `/api/v2/` JSON:API.
+Group discovery uses GraphQL (`/graphql`); group membership uses the HTML directory
+and Rails forms. The school directory and staff details use the internal `/api/v2/` JSON:API.
 
 ## Dependencies
 

@@ -249,7 +249,9 @@ class PSClient:
         self._save_cookies_if_changed()
         return resp
 
-    def post_form(self, path: str, data: dict) -> requests.Response:
+    def post_form(
+        self, path: str, data: dict, *, html_response: bool = False,
+    ) -> requests.Response:
         """POST an application/x-www-form-urlencoded body (Rails admin write form).
 
         Injects ``utf8=✓`` and ``authenticity_token`` and sends the CSRF token as
@@ -257,19 +259,29 @@ class PSClient:
         Response (these endpoints reply with a ``text/javascript`` UJS script, not
         JSON). Does NOT raise on 4xx/5xx so callers can inspect the body; use the
         status code and body to detect success.
+
+        Group membership forms are ordinary browser navigations, not Rails UJS.
+        Set ``html_response=True`` for those: request HTML without the XHR header
+        and follow the redirect. Their success must be verified by reading back
+        membership, not by the roster tools' JavaScript-response heuristic.
         """
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "Origin": BASE_URL,
+        }
+        if html_response:
+            headers["Accept"] = BROWSER_HEADERS["Accept"]
+        else:
+            headers["Accept"] = (
+                "*/*;q=0.5, text/javascript, application/javascript, "
+                "application/ecmascript, application/x-ecmascript"
+            )
+            headers["X-Requested-With"] = "XMLHttpRequest"
         resp = self._with_csrf(
             lambda csrf_token: self.session.post(
                 f"{BASE_URL}{path}",
                 data={"utf8": "\u2713", "authenticity_token": csrf_token, **data},
-                headers={
-                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                    "Accept": "*/*;q=0.5, text/javascript, application/javascript, "
-                    "application/ecmascript, application/x-ecmascript",
-                    "X-CSRF-Token": csrf_token,
-                    "X-Requested-With": "XMLHttpRequest",
-                    "Origin": BASE_URL,
-                },
+                headers={**headers, "X-CSRF-Token": csrf_token},
             )
         )
         self._save_cookies_if_changed()

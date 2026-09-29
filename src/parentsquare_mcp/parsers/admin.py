@@ -1,9 +1,7 @@
 """Parsing and request-body helpers for the admin write tools.
 
-All ParentSquare admin write endpoints were reverse-engineered and verified live
-(see the vault note "ParentSquare admin API mapping"). This module keeps the
-pure, testable logic — positional-row parsing, edit-form field extraction, and
-form-body construction — out of the MCP tool layer.
+This module keeps the pure, testable logic — positional-row parsing, edit-form
+field extraction, and form-body construction — out of the MCP tool layer.
 """
 from __future__ import annotations
 

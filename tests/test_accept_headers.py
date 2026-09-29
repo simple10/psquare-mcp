@@ -116,3 +116,26 @@ def test_api_v2_write_helpers_keep_the_wider_browser_accept(monkeypatch, send):
 
     send(c)
     assert seen["accept"] == "application/json, text/javascript, */*; q=0.01"
+
+
+@pytest.mark.parametrize("html_response", [False, True])
+def test_form_transport_distinguishes_group_navigation_from_roster_ujs(monkeypatch, html_response):
+    seen = {}
+
+    def post(url, **kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(status_code=200, text="", url=url, headers={})
+
+    c = PSClient(session=SimpleNamespace(post=post))
+    monkeypatch.setattr(c, "_get_csrf_token", lambda force_refresh=False: "test-csrf")
+    monkeypatch.setattr(c, "_save_cookies_if_changed", lambda: None)
+    c.post_form("/groups/9", {"_method": "patch"}, html_response=html_response)
+    assert seen["data"]["authenticity_token"] == "test-csrf"
+    assert seen["headers"]["X-CSRF-Token"] == "test-csrf"
+    if html_response:
+        assert "text/html" in seen["headers"]["Accept"]
+        assert "X-Requested-With" not in seen["headers"]
+        assert "javascript" not in seen["headers"]["Accept"]
+    else:
+        assert "text/javascript" in seen["headers"]["Accept"]
+        assert seen["headers"]["X-Requested-With"] == "XMLHttpRequest"

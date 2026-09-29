@@ -125,6 +125,30 @@ class Group:
 
 
 @dataclass
+class GroupMember:
+    user_id: int
+    name: str
+    role: str
+    removable: bool = False
+
+
+@dataclass
+class GroupMembersPage:
+    name: str
+    school_id: int
+    total_count: int
+    student_count: int
+    members: list[GroupMember]
+    next_page: int | None = None
+
+
+@dataclass
+class GroupMemberSelection:
+    member_ids: list[int]
+    student_ids: list[int]
+
+
+@dataclass
 class Notice:
     title: str
     notice_type: str  # "alert" or "document"
