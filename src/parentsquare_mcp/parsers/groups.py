@@ -235,6 +235,11 @@ def build_add_group_members_body(selection: GroupMemberSelection, user_ids: list
     The blank EXTERNAL row is the browser's unfilled guest-creation row, not an
     existing membership or owner. No names, contacts, ownership, group settings,
     or guest-consent flags may be supplied through this existing-user operation.
+
+    Existing guest IDs are submitted in member_tokens too, but ParentSquare
+    restores them as guest associations and omits them from the saved tokens.
+    Verify their presence/role in the directory, not their inclusion in the
+    subsequent selection field. Pinned by tests/test_groups.py.
     """
     prefix = "group[group_user_associations_attributes][0]"
     return {

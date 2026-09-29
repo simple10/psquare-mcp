@@ -1523,7 +1523,6 @@ async def _change_group_members(app, context, group_id, user_ids, *, removing):
             else:
                 path = f"/groups/{group_id}"
                 body = build_add_group_members_body(selection, batch)
-                expected_selected.update(batch)
 
             transport_error = None
             response = None
@@ -1556,6 +1555,9 @@ async def _change_group_members(app, context, group_id, user_ids, *, removing):
                 ))
             after, selected = state
             actual_roles = {m.user_id: m.role for m in after.members}
+            if not removing:
+                # Existing guests return as guest associations, not saved user tokens.
+                expected_selected.update(u for u in batch if actual_roles.get(u) == "member")
             expected_ids = set(expected_roles) if removing else set(expected_roles) | set(batch)
             preserved = all(actual_roles.get(u) == role for u, role in expected_roles.items())
             ordinary_additions = removing or all(

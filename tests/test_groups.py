@@ -170,7 +170,8 @@ class FakeClient:
         self.break_readback = False
         self.collateral = False
         self.timeout = False
-        self.available = {2, 3, 5, 6}
+        self.guest_users = {3, 7}
+        self.available = {2, 3, 5, 6, 7}
 
     def get_page(self, path, params=None):
         if self.break_readback and self.writes:
@@ -197,9 +198,10 @@ class FakeClient:
                 self.selected = [u for u in self.selected if u != user_id]
             else:
                 assert path == "/groups/9"
-                self.selected = [int(u) for u in body["group[member_tokens]"].split(",")]
-                for user_id in self.selected:
-                    self.roles.setdefault(user_id, "member")
+                requested = [int(u) for u in body["group[member_tokens]"].split(",")]
+                for user_id in requested:
+                    self.roles.setdefault(user_id, "guest" if user_id in self.guest_users else "member")
+                self.selected = [u for u in requested if self.roles[u] != "guest"]
             if self.collateral:
                 self.roles.pop(1, None)
         if self.timeout:
@@ -265,6 +267,52 @@ def test_remove_targets_each_person_without_replacing_the_group(fixture):
     ]
     assert all(b == {"_method": "post"} for _, b in client.writes)
     assert client.roles == {1: "owner", 4: "manager"}
+
+
+@pytest.mark.parametrize("targets,selected", [([7], [2]), ([5, 7], [2, 5])])
+def test_add_existing_guests_are_verified_outside_saved_user_tokens(fixture, targets, selected):
+    client, context = fixture
+    baseline = dict(client.roles)
+    result = asyncio.run(server.add_group_members(9, targets, context=context))
+    assert result.startswith("✅")
+    assert client.roles[7] == "guest"
+    assert all(client.roles[u] == role for u, role in baseline.items())
+    assert client.selected == selected
+    assert "7" in client.writes[0][1]["group[member_tokens]"].split(",")
+
+
+def test_guest_remove_and_readd_restores_exact_original_state(fixture):
+    client, context = fixture
+    baseline_roles = dict(client.roles)
+    baseline_selection = list(client.selected)
+    assert asyncio.run(server.remove_group_members(9, [3], context=context)).startswith("✅")
+    assert 3 not in client.roles
+    assert asyncio.run(server.add_group_members(9, [3], context=context)).startswith("✅")
+    assert client.roles == baseline_roles
+    assert client.selected == baseline_selection
+
+
+def test_guest_add_still_requires_the_guest_to_appear_in_the_directory(fixture):
+    client, context = fixture
+    client.apply = False
+    result = asyncio.run(server.add_group_members(9, [7], context=context))
+    assert result.startswith("⚠️")
+    assert "Missing expected user_ids: [7]" in result
+
+
+def test_ordinary_member_add_still_requires_saved_user_token(fixture, monkeypatch):
+    client, context = fixture
+    original = client.post_form
+
+    def post(*args, **kwargs):
+        response = original(*args, **kwargs)
+        client.selected.remove(5)
+        return response
+
+    monkeypatch.setattr(client, "post_form", post)
+    result = asyncio.run(server.add_group_members(9, [5], context=context))
+    assert result.startswith("⚠️")
+    assert client.roles[5] == "member"
 
 
 @pytest.mark.parametrize("tool,ids", [
