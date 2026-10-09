@@ -64,3 +64,30 @@ def test_redact_url_drops_presigned_credentials():
 
 def test_redact_url_drops_userinfo_and_keeps_port():
     assert redact_url("https://user:pw@host.example:8443/a/b?t=1") == "https://host.example:8443/a/b"
+
+
+@pytest.mark.parametrize(
+    "href",
+    [
+        "/feeds/91117195/attachment/291377755",
+        "https://www.parentsquare.com/feeds/91117195/attachment/291377755",
+    ],
+)
+def test_parentsquare_attachment_proxy_is_an_attachment(href):
+    # Since 2026-10 the post page links files through a same-site proxy that
+    # 302s to the pre-signed S3 object instead of linking S3 directly.
+    assert is_attachment_href(href)
+
+
+@pytest.mark.parametrize(
+    "href",
+    [
+        "https://evil.example/feeds/1/attachment/2",
+        "https://parentsquare.com.evil.example/feeds/1/attachment/2",
+        "/feeds/1/attachment/2/../../../signout",
+        "/feeds/abc/attachment/2",
+        "/feeds/1/attachments/2",
+    ],
+)
+def test_lookalike_proxy_paths_are_not_attachments(href):
+    assert not is_attachment_href(href)

@@ -5,6 +5,7 @@ import re
 from bs4 import BeautifulSoup, NavigableString
 
 from parentsquare_mcp.models import Poll, PollOption
+from parentsquare_mcp.parsers.feeds import iter_feed_boxes
 
 
 def parse_polls_page(soup: BeautifulSoup) -> list[Poll]:
@@ -26,11 +27,7 @@ def parse_polls_page(soup: BeautifulSoup) -> list[Poll]:
     if not feeds_list:
         return polls
 
-    for ps_box in feeds_list.find_all("div", class_="ps-box", recursive=False):
-        feed_id_el = ps_box.find("div", id=re.compile(r"^feed_\d+"))
-        if not feed_id_el:
-            continue
-        feed_id = int(feed_id_el["id"].replace("feed_", ""))
+    for feed_id, ps_box in iter_feed_boxes(feeds_list):
 
         # Question text — polls use <a> inside .subject, not span[role=heading]
         heading = ps_box.find(attrs={"role": "heading"})

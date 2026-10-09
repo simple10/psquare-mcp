@@ -46,16 +46,58 @@ def _disposition_filename(url: str) -> str | None:
         return None
 
 
+_GENERIC_LINK_NAMES = {"", "file", "all", "download"}
+
+
+def _link_file_name(link: Tag) -> str | None:
+    """Filename carried by an attachment anchor's label, if it is not generic.
+
+    The proxy href carries no filename, so the name lives in the anchor's text
+    or ``aria-label`` ("Download Board Agenda.pdf"). The nav-pill link to the
+    same file only says "Download File"; that is not a name.
+    """
+    for raw in (link.get("aria-label", ""), link.get_text(" ", strip=True)):
+        name = re.sub(r"^Download\s*", "", raw.strip(), flags=re.IGNORECASE).strip()
+        if name.lower() not in _GENERIC_LINK_NAMES:
+            return name
+    return None
+
+
 def _url_path_key(url: str) -> str:
     """Normalize a URL to just its path for cross-referencing thumbnail vs download URLs."""
     return unquote(urlparse(url).path)
+
+
+def iter_feed_boxes(feeds_list: Tag):
+    """Yield ``(feed_id, ps_box)`` for every post inside ``div#feeds-list``.
+
+    ParentSquare has shipped two layouts for the same page:
+
+      legacy:  div#feeds-list > div.ps-box > div.feed > div#feed_{id}
+      current: div#feeds-list > ul.feeds-list > li.feeds-list-item > div.ps-box > ...
+
+    The ``ul``/``li`` wrapper (observed live 2026-10-08) made a
+    ``find_all("div", class_="ps-box", recursive=False)`` return nothing, so every
+    feed-shaped tool reported "No posts found" against a page carrying ten posts.
+    Anchoring on ``div#feed_{id}`` and walking up to its ``.ps-box`` container is
+    layout-independent and still ignores unrelated ``.ps-box`` chrome (sidebars,
+    filters) that carries no feed id. Pinned by tests/test_feeds.py.
+    """
+    seen: set[int] = set()
+    for feed_id_el in feeds_list.find_all("div", id=re.compile(r"^feed_\d+$")):
+        feed_id = int(feed_id_el["id"].replace("feed_", ""))
+        if feed_id in seen:
+            continue
+        seen.add(feed_id)
+        ps_box = feed_id_el.find_parent("div", class_="ps-box") or feed_id_el
+        yield feed_id, ps_box
 
 
 def parse_feed_page(soup: BeautifulSoup) -> list[FeedPost]:
     """Parse /schools/{id}/feeds?page=N -> list of FeedPost.
 
     Feed structure:
-      #feeds-list > div.ps-box > div.feed > div#feed_{id} > div.feed-show
+      #feeds-list > (ul.feeds-list > li.feeds-list-item >)? div.ps-box > div.feed > div#feed_{id} > div.feed-show
         .feed-title > .subject a span[role=heading]  (title)
         .feed-metadata > .user-name  (author)
         .feed-metadata > .time-ago[data-timestamp]  (date)
@@ -69,13 +111,7 @@ def parse_feed_page(soup: BeautifulSoup) -> list[FeedPost]:
     if not feeds_list:
         return posts
 
-    for ps_box in feeds_list.find_all("div", class_="ps-box", recursive=False):
-        feed_id_el = ps_box.find("div", id=re.compile(r"^feed_\d+"))
-        if not feed_id_el:
-            continue
-
-        feed_id = int(feed_id_el["id"].replace("feed_", ""))
-
+    for feed_id, ps_box in iter_feed_boxes(feeds_list):
         # Title — can be <span> or <div> with role="heading"
         heading = ps_box.find(attrs={"role": "heading"})
         title = heading.get_text(strip=True) if heading else ""
@@ -261,10 +297,10 @@ def parse_post_detail(soup: BeautifulSoup) -> PostDetail:
         href = link["href"]
         if is_attachment_href(href):
             path_key = _url_path_key(href)
-            disp_name = _disposition_filename(href)
-            if disp_name:
-                download_names[path_key] = disp_name
-            download_urls[path_key] = href
+            name = _disposition_filename(href) or _link_file_name(link)
+            if name and path_key not in download_names:
+                download_names[path_key] = name
+            download_urls.setdefault(path_key, href)
 
     # Attachments — gallery/thumbnail images (e.g. photo posts)
     attachments: list[Attachment] = []
@@ -321,10 +357,7 @@ def parse_post_detail(soup: BeautifulSoup) -> PostDetail:
         if path_key in seen_paths:
             continue
         seen_paths.add(path_key)
-        name = _disposition_filename(href)
-        if not name:
-            name = link.get_text(strip=True)
-            name = re.sub(r"^Download\s*", "", name).strip() or _filename_from_url(href)
+        name = download_names.get(path_key) or _filename_from_url(href)
         attachments.append(
             Attachment(
                 name=name,

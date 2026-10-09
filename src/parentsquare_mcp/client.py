@@ -342,7 +342,15 @@ class PSClient:
         return resp.json()
 
     def get_raw(self, url: str, stream: bool = False) -> requests.Response:
-        """GET a raw URL (for S3/CloudFront downloads). No base URL prepended."""
+        """GET a raw URL (S3/CloudFront downloads, or a site-relative attachment path).
+
+        Absolute URLs are fetched as-is. A path starting with ``/`` (the
+        ``/feeds/{id}/attachment/{aid}`` proxy that ``is_attachment_href``
+        admits) is resolved against ``BASE_URL``; the proxy 302s to S3 and
+        ``requests`` follows it.
+        """
+        if url.startswith("/"):
+            url = f"{BASE_URL}{url}"
         resp = self.session.get(url, stream=stream)
         resp.raise_for_status()
         return resp

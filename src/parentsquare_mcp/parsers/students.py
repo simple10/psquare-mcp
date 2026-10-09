@@ -9,7 +9,7 @@ def parse_student_dashboard(soup: BeautifulSoup) -> StudentDashboard:
     """Parse /students/{id}/dashboard -> StudentDashboard.
 
     Structure:
-      .student-info-name-container h3 a  (student name)
+      .student-info-name-container h1|h3 a  (student name)
       .student-info-name-container > div  (grade)
       .site-header  (school context)
       #student-classes table tbody tr td  (classes)
@@ -22,10 +22,11 @@ def parse_student_dashboard(soup: BeautifulSoup) -> StudentDashboard:
     student_name = ""
     grade = None
     if name_container:
-        h3 = name_container.find("h3")
+        # Heading level changed from h3 to h1 (observed live 2026-10-08).
+        h3 = name_container.find(["h1", "h2", "h3"])
         if h3:
             student_name = h3.get_text(strip=True)
-        # Grade is in a sibling div after the h3
+        # Grade is in a sibling div after the heading
         grade_div = name_container.find("div")
         if grade_div and grade_div != h3:
             grade = grade_div.get_text(strip=True) or None
