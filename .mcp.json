@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "parentsquare": {
+      "command": "bash",
+      "args": [
+        "mcp-start-jailed.sh"
+      ]
+    }
+  }
+}

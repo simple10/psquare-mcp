@@ -22,3 +22,6 @@ nul
 
 # Cygwin/MSYS crash dumps
 *.stackdump
+
+# Added data directory, not in upstream
+.data/
